@@ -1,0 +1,75 @@
+#!/bin/bash
+# This script configure the router to use fastest available gateway
+# as default one. It uses some bashism...
+[ -f /tmp/router.order ] && logger "Already running" && exit 1
+NICS=($(ip -br link|awk '{print $1}')) # index 0 is loopback (lo)
+NNICS=$((${#NICS[@]}-1))
+GWS=()
+IPS=()
+iptables -t mangle -F
+iptables -t nat -F
+# Did we lost all of our gateways?
+ip route | grep -q default || \
+for ((i=1; i<=$NNICS; i++))
+do
+	ifdown ${NICS[$i]}
+	ifup ${NICS[$i]} && \
+	logger "${NICS[$i]} restarted." || \
+	logger "Unable to restart ${NICS[$i]}."
+done
+# Prepare routing tables for each gateway
+for ((i=1; i<=$NNICS; i++))
+do
+	IPS[$i]="$(ip a s ${NICS[$i]}|awk '/inet/{print $2}'|cut -d/ -f1)"
+	[ -z "${IPS[$i]}" ] && GWS[$i]="" && continue
+	# disable kernel filtering of "unwanted" packets
+	echo 0 > /proc/sys/net/ipv4/conf/${NICS[$i]}/rp_filter
+	GWS[$i]="$(ip r | grep default | grep -v dead | grep ${NICS[$i]} | cut -d\  -f3)"
+	[ -z "${GWS[$i]}" ] && continue
+	# duplicate main routing table for each live default gateway
+	ip route flush table $i
+	ip route show table main | grep -Ev ^default | while read ROUTE ; do
+		ip route add table $i $ROUTE
+	done
+	# add default gateway
+	ip route add table $i default via ${GWS[$i]} dev ${NICS[$i]}
+	# mark packets from localhost
+	iptables -t mangle -A OUTPUT -s ${IPS[$i]} -j MARK --set-mark $i
+	# activate alternate routing
+	while $(ip rule del fwmark $i table $i);do .;done 2>/dev/null
+	ip rule add fwmark $i table $i prio ${i}0
+	# MASQUERADE or SNAT ?
+	iptables -t nat -I POSTROUTING -o ${NICS[$i]} -j MASQUERADE #SNAT --to-source ${IPS[$i]}
+done
+# activate changes in policy routing
+ip route flush cache
+# ping same target via each gateway
+for ((i=1; i<=$NNICS; i++))
+do
+	[ -z "${GWS[$i]}" ] && continue
+	( ping -n -c 5 -q -I ${IPS[$i]} 1.1 >/dev/null \
+		&& logger "1.1 responded for ${IPS[$i]} dev ${NICS[$i]}" \
+		|| logger "No response from 1.1 for ${IPS[$i]} dev ${NICS[$i]}" ; \
+		echo $i >> /tmp/router.order ) &
+done
+wait -n # first gateway to complete
+# meanwhile, main routing table is still active
+INDEX=$(head -1 /tmp/router.order)
+METRIC=1
+for ((i=1; i<=$NNICS; i++))
+do
+	[ -z "${GWS[$i]}" ] && continue
+	ip route del default via ${GWS[$i]} dev ${NICS[$i]}
+done
+ip route add default via ${GWS[$INDEX]} dev ${NICS[$INDEX]} metric $METRIC
+echo 1 > /proc/sys/net/ipv4/ip_forward
+logger "Default route set via ${GWS[$INDEX]} dev ${NICS[$INDEX]}."
+wait # other gateways
+cat /tmp/router.order | while read i
+do
+	[ $i -eq $INDEX ] && continue
+	METRIC=$(($METRIC+1))
+	ip r a default via ${GWS[$i]} dev ${NICS[$i]} metric $METRIC
+done
+rm -f /tmp/router.order
+exit 0
